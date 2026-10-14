@@ -218,3 +218,20 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Datasets
+/data/
+
+# Generated outputs
+/outputs/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local environment
+.env
+.venv/
