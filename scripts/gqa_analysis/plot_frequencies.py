@@ -1,226 +1,180 @@
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
+"""Plot GQA label-frequency distributions from inspect_gqa.py CSV outputs.
 
+For each label type (object classes, attributes, relations), produce:
+- independent train/validation rank-frequency curves (positive counts only);
+- relative frequencies for the top-N *training* labels, compared across splits.
+
+Run from any working directory, for example:
+    python scripts/gqa_analysis/plot_frequencies.py --dataset original
+    python scripts/gqa_analysis/plot_frequencies.py --dataset cleaned --top-n 30
+
+The script reads only precomputed tables and does not modify annotations.
+"""
+
+import argparse
 from pathlib import Path
 
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 
-# ---------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+ANALYSIS_ROOT = PROJECT_ROOT / "outputs" / "gqa_analysis"
 
-INPUT_DIR = Path("outputs/gqa_analysis/tables")
-OUTPUT_DIR = Path("outputs/gqa_analysis/plots")
-
-
-# ---------------------------------------------------------------------
-# Plot configuration
-# ---------------------------------------------------------------------
-
-DATASETS = [
+DATASETS = (
     ("class_frequencies.csv", "Object Classes"),
     ("attribute_frequencies.csv", "Attributes"),
     ("relation_frequencies.csv", "Relations"),
-]
+)
+
+REQUIRED_COLUMNS = ("label", "train_count", "val_count")
 
 
-# ---------------------------------------------------------------------
-# Rank-frequency distributions
-# ---------------------------------------------------------------------
-
-def plot_frequency_distributions():
-    """
-    Plot train and validation rank-frequency distributions for
-    object classes, attributes, and relations.
-
-    Labels are sorted by train frequency and the y-axis uses
-    logarithmic scale to highlight the long-tail distribution.
-    """
-
-    fig, axes = plt.subplots(
-        1,
-        3,
-        figsize=(24, 8),
+def parse_args() -> argparse.Namespace:
+    """Read command-line options."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--dataset", choices=("original", "cleaned"), default="original",
+        help="Which GQA dataset version to analyze (default: original).",
     )
-
-    for ax, (csv_name, title) in zip(axes, DATASETS):
-        df = pd.read_csv(INPUT_DIR / csv_name)
-
-        df = df.sort_values(
-            "train_count",
-            ascending=False,
-        ).reset_index(drop=True)
-
-        ax.plot(
-            range(len(df)),
-            df["train_count"],
-            label="Train",
-        )
-
-        ax.plot(
-            range(len(df)),
-            df["val_count"],
-            label="Validation",
-        )
-
-        ax.set_yscale("log")
-
-        ax.set_xlabel("Labels sorted by train frequency")
-        ax.set_ylabel("Frequency")
-        ax.set_title(title)
-
-    handles, labels = axes[0].get_legend_handles_labels()
-
-    fig.suptitle(
-        "GQA Label Frequency Distributions",
-        fontsize=16,
-        y=0.98,
+    parser.add_argument(
+        "--top-n", type=int, default=30,
+        help="Number of labels selected by training frequency (default: 30).",
     )
-
-    fig.legend(
-        handles,
-        labels,
-        loc="upper center",
-        bbox_to_anchor=(0.5, 0.94),
-        ncol=2,
-    )
-
-    plt.tight_layout(
-        rect=[0, 0, 1, 0.90]
-    )
-
-    output_path = (
-        OUTPUT_DIR
-        / "frequency_distributions_combined.png"
-    )
-
-    plt.savefig(
-        output_path,
-        dpi=200,
-        bbox_inches="tight",
-    )
-
-    plt.close()
-
-    print(f"Saved: {output_path}")
+    args = parser.parse_args()
+    if args.top_n < 1:
+        parser.error("--top-n must be a positive integer")
+    return args
 
 
-# ---------------------------------------------------------------------
-# Most frequent labels
-# ---------------------------------------------------------------------
-
-def plot_top_labels_relative(top_n=30):
-    """
-    Plot the most frequent labels using relative frequencies.
-
-    Relative frequencies are used because train and validation
-    contain different numbers of annotations.
-    """
-
-    fig, axes = plt.subplots(
-        1,
-        3,
-        figsize=(24, 10),
-    )
-
-    for ax, (csv_name, title) in zip(axes, DATASETS):
-        df = pd.read_csv(INPUT_DIR / csv_name)
-
-        df["train_percentage"] = (
-            df["train_count"]
-            / df["train_count"].sum()
-            * 100
-        )
-
-        df["val_percentage"] = (
-            df["val_count"]
-            / df["val_count"].sum()
-            * 100
-        )
-
-        df = (
-            df.sort_values(
-                "train_percentage",
-                ascending=False,
+def load_frequency_tables(input_dir: Path) -> list[tuple[str, pd.DataFrame]]:
+    """Load and validate each frequency table generated by inspect_gqa.py."""
+    tables = []
+    for filename, title in DATASETS:
+        path = input_dir / filename
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Missing input: {path}\nRun inspect_gqa.py with the same --dataset first."
             )
-            .head(top_n)
-            .iloc[::-1]
-        )
-
-        y = np.arange(len(df))
-        height = 0.4
-
-        ax.barh(
-            y - height / 2,
-            df["train_percentage"],
-            height=height,
-            label="Train",
-        )
-
-        ax.barh(
-            y + height / 2,
-            df["val_percentage"],
-            height=height,
-            label="Validation",
-        )
-
-        ax.set_yticks(y)
-        ax.set_yticklabels(df["label"])
-
-        ax.set_xlabel(
-            "Percentage of occurrences within split"
-        )
-
-        ax.set_title(title)
-
-    handles, labels = axes[0].get_legend_handles_labels()
-
-    fig.suptitle(
-        "GQA Label Frequency Distributions",
-        fontsize=16,
-        y=0.98,
-    )
-
-    fig.legend(
-        handles,
-        labels,
-        loc="upper center",
-        bbox_to_anchor=(0.5, 0.94),
-        ncol=2,
-    )
-
-    plt.tight_layout(
-        rect=[0, 0, 1, 0.90]
-    )
-
-    output_path = (
-        OUTPUT_DIR
-        / "top_labels_relative_combined.png"
-    )
-
-    plt.savefig(
-        output_path,
-        dpi=200,
-        bbox_inches="tight",
-    )
-
-    plt.close()
-
-    print(f"Saved: {output_path}")
+        df = pd.read_csv(path)
+        missing = set(REQUIRED_COLUMNS) - set(df.columns)
+        if missing:
+            raise ValueError(f"{path}: missing columns {sorted(missing)}")
+        for col in ("train_count", "val_count"):
+            counts = pd.to_numeric(df[col], errors="coerce")
+            if counts.isna().any() or (counts < 0).any() or (counts % 1 != 0).any():
+                raise ValueError(f"{path}: {col} must contain nonnegative integer counts")
+            df[col] = counts.astype("int64")
+        tables.append((title, df))
+    return tables
 
 
-# ---------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------
+def plot_frequency_distributions(
+    tables: list[tuple[str, pd.DataFrame]], output_dir: Path
+) -> Path:
+    """Plot independent rank-frequency curves for train and validation.
 
-def main():
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    Each split is sorted separately in descending order, so rank k can
+    represent different labels in the two curves. Zero counts are omitted
+    because the frequency axis is logarithmic.
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(24, 8))
+    try:
+        for ax, (title, df) in zip(axes, tables):
+            for column, label in (("train_count", "Train"), ("val_count", "Validation")):
+                frequencies = np.sort(
+                    df.loc[df[column] > 0, column].to_numpy(dtype=np.int64)
+                )[::-1]
+                if frequencies.size:
+                    ranks = np.arange(1, frequencies.size + 1)
+                    ax.plot(ranks, frequencies, label=label)
+                else:
+                    # Legend remains informative even if one split is empty.
+                    ax.plot([], [], label=f"{label} (no occurrences)")
 
-    plot_frequency_distributions()
-    plot_top_labels_relative()
+            ax.set_yscale("log")
+            ax.set_xlabel("Label rank (independently sorted per split)")
+            ax.set_ylabel("Number of occurrences")
+            ax.set_title(title)
+            ax.legend()
+            ax.grid(axis="y", alpha=0.25)
+
+        fig.suptitle("GQA Label Rank-Frequency Distributions", fontsize=16)
+        fig.tight_layout(rect=(0, 0, 1, 0.95))
+        output_path = output_dir / "frequency_distributions_combined.png"
+        fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    finally:
+        plt.close(fig)
+    return output_path
+
+
+def plot_top_labels_relative(
+    tables: list[tuple[str, pd.DataFrame]], output_dir: Path, top_n: int = 30
+) -> Path:
+    """Compare percentages for labels selected by training count.
+
+    Each percentage is relative to the total number of annotations of
+    that label type in its own split. A selected label can have 0% in val.
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(24, 10))
+    try:
+        for ax, (title, df) in zip(axes, tables):
+            df = df.copy()
+            train_total = int(df["train_count"].sum())
+            val_total = int(df["val_count"].sum())
+
+            # When a split contains no annotations, percentages are not
+            # defined. We display 0-length bars and explain it on the axis.
+            df["train_percentage"] = (
+                df["train_count"] / train_total * 100 if train_total else 0.0
+            )
+            df["val_percentage"] = (
+                df["val_count"] / val_total * 100 if val_total else 0.0
+            )
+            # Labels absent from training are not part of training's top N.
+            selected = (
+                df.loc[df["train_count"] > 0]
+                .sort_values(["train_count", "label"], ascending=[False, True])
+                .head(top_n)
+                .iloc[::-1]
+            )
+            y = np.arange(len(selected))
+            height = 0.4
+            ax.barh(y - height / 2, selected["train_percentage"],
+                    height=height, label="Train")
+            ax.barh(y + height / 2, selected["val_percentage"],
+                    height=height, label="Validation")
+            ax.set_yticks(y)
+            ax.set_yticklabels(selected["label"].astype(str))
+            ax.set_xlabel("Percentage of annotations within split (%)")
+            ax.set_title(title)
+            ax.legend()
+            if not train_total or not val_total:
+                absent = "train" if not train_total else "validation"
+                ax.text(0.02, 0.02, f"No {absent} annotations: percentages undefined",
+                        transform=ax.transAxes, fontsize=9, va="bottom")
+            if selected.empty:
+                ax.text(0.5, 0.5, "No labels in training split",
+                        ha="center", va="center", transform=ax.transAxes)
+        fig.suptitle(f"GQA Top-{top_n} Training Labels: Relative Frequencies", fontsize=16)
+        fig.tight_layout(rect=(0, 0, 1, 0.95))
+        output_path = output_dir / "top_labels_relative_combined.png"
+        fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    finally:
+        plt.close(fig)
+    return output_path
+
+
+def main() -> None:
+    """Read selected dataset's tables and save two combined figures."""
+    args = parse_args()
+    input_dir = ANALYSIS_ROOT / args.dataset / "tables"
+    output_dir = ANALYSIS_ROOT / args.dataset / "plots"
+    tables = load_frequency_tables(input_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Dataset: {args.dataset}")
+    print(f"Saved: {plot_frequency_distributions(tables, output_dir)}")
+    print(f"Saved: {plot_top_labels_relative(tables, output_dir, args.top_n)}")
 
 
 if __name__ == "__main__":
