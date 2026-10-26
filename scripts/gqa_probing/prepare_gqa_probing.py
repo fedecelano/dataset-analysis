@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Filter GQA scene graphs for probing using canonical 100-label vocabularies.
+"""Prepare GQA scene graphs with 14 object, 5 attribute, and 7 relation labels.
 
 Semantic object filtering precedes bounding-box validation. Selected objects
 with invalid boxes are removed; partially out-of-frame boxes are clipped.
@@ -16,14 +16,14 @@ import math
 from pathlib import Path
 
 VOCABS = ("object", "attribute", "relation")
-EXPECTED_VOCAB_SIZE = 100
+EXPECTED_VOCAB_SIZES = {"object": 14, "attribute": 5, "relation": 7}
 
 
 def load_rules(config_dir: Path) -> dict:
     """Load KEEP/MERGE/REMOVE mappings and validate their consistency."""
     rules = {}
     for kind in VOCABS:
-        path = config_dir / f"{kind}_mapping.json"
+        path = config_dir / f"{kind}_mapping_macro.json"
         with path.open(encoding="utf-8") as stream:
             data = json.load(stream)
         if not isinstance(data, dict) or set(data) != {"keep", "merge", "remove"}:
@@ -35,8 +35,8 @@ def load_rules(config_dir: Path) -> dict:
         labels = [*keep_list, *remove_list, *merge.keys(), *merge.values()]
         if not all(isinstance(label, str) and label for label in labels):
             raise ValueError(f"Labels must be nonempty strings: {path}")
-        if len(set(keep_list)) != EXPECTED_VOCAB_SIZE or len(keep_list) != EXPECTED_VOCAB_SIZE:
-            raise ValueError(f"Expected {EXPECTED_VOCAB_SIZE} unique KEEP labels: {path}")
+        if len(set(keep_list)) != EXPECTED_VOCAB_SIZES[kind] or len(keep_list) != EXPECTED_VOCAB_SIZES[kind]:
+            raise ValueError(f"Expected {EXPECTED_VOCAB_SIZES[kind]} unique KEEP labels: {path}")
         if len(set(remove_list)) != len(remove_list):
             raise ValueError(f"Duplicate REMOVE labels: {path}")
         keep, remove = set(keep_list), set(remove_list)
@@ -130,10 +130,12 @@ def preprocess_graph(image_graph: dict, rules: dict, counts: Counter) -> dict | 
         if status == "invalid":
             counts["objects_removed_invalid_bbox"] += 1
             continue
+        obj["original_name"] = source.get("name")
         obj["name"] = new_name
         # Attribute filtering is performed only on surviving objects.
         original_attrs = source.get("attributes", [])
         counts["attributes_on_retained_objects_before"] += len(original_attrs)
+        obj["original_attributes"] = deepcopy(original_attrs)
         obj["attributes"] = []
         for attr in original_attrs:
             mapped = resolve(attr, rules["attribute"], counts, "attribute")
@@ -160,6 +162,7 @@ def preprocess_graph(image_graph: dict, rules: dict, counts: Counter) -> dict | 
                 counts["relations_removed_missing_target"] += 1
                 continue
             new_rel = deepcopy(rel)
+            new_rel["original_name"] = rel.get("name")
             new_rel["name"] = name
             obj["relations"].append(new_rel)
             counts["relations_after"] += 1
@@ -243,6 +246,8 @@ def main() -> None:
     input_dir, output_dir = args.input_dir.resolve(), args.output_dir.resolve()
     if input_dir == output_dir or input_dir in output_dir.parents or output_dir in input_dir.parents:
         raise ValueError("Input and output directories must be disjoint")
+    if output_dir.name == "gqa_cleaned":
+        raise ValueError("Refusing to overwrite the legacy gqa_cleaned dataset")
     if len(set(args.splits)) != len(args.splits):
         raise ValueError("Duplicate splits requested")
     rules = load_rules(args.config_dir)
