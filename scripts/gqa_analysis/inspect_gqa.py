@@ -1,15 +1,19 @@
-"""Generate summary and vocabulary CSV tables for GQA scene graphs.
 
-Analyze the original or cleaned GQA train and validation splits without
-modifying their annotations. Counts refer to annotation occurrences, not
-numbers of distinct images containing a label.
+"""Generate summary statistics and vocabulary tables for GQA scene graphs.
 
-Run from any working directory::
+Analyze the train and validation splits of the original or cleaned GQA
+dataset without modifying the source annotations.
 
+Counts represent annotation occurrences, not the number of distinct
+images containing a label. Labels are preserved as recorded in the
+scene graphs, without normalization.
+
+Outputs are saved to:
+    outputs/gqa_analysis/<dataset>/tables/
+
+Usage:
     python scripts/gqa_analysis/inspect_gqa.py --dataset original
     python scripts/gqa_analysis/inspect_gqa.py --dataset cleaned
-
-Outputs are written to outputs/gqa_analysis/<dataset>/tables/.
 """
 
 import argparse
@@ -20,18 +24,18 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 DATASET_DIRS = {
     "original": PROJECT_ROOT / "data" / "gqa" / "annotations",
     "cleaned": PROJECT_ROOT / "data" / "gqa_cleaned" / "annotations",
 }
+
 OUTPUT_ROOT = PROJECT_ROOT / "outputs" / "gqa_analysis"
 
 
-def parse_args():
-    """Parse the dataset to analyze (original by default)."""
-    parser = argparse.ArgumentParser(
-        description="Generate statistical tables for GQA scene graphs."
-    )
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--dataset",
         choices=tuple(DATASET_DIRS),
@@ -41,17 +45,23 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_json(path):
-    """Load a GQA scene graph JSON file."""
+def load_json(path: Path) -> dict:
+    """Load a GQA scene-graph JSON file."""
     with path.open("r", encoding="utf-8") as file:
-        return json.load(file)
+        data = json.load(file)
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"Expected a dictionary of scene graphs in {path}"
+        )
+
+    return data
 
 
-def analyze_split(data):
-    """Count images and annotated object, attribute and relation occurrences.
+def analyze_split(data: dict) -> dict:
+    """Compute annotation totals and label frequencies for one split.
 
-    Return image and annotation totals, plus one Counter per label type.
-    Each occurrence is counted, including multiple occurrences in one image.
+    Every annotated object, attribute, and relation occurrence is counted.
     Labels are used as-is, without normalization.
     """
     class_counts = Counter()
@@ -86,8 +96,11 @@ def analyze_split(data):
     }
 
 
-def compare_vocabularies(train_counts, val_counts):
-    """Return vocabulary sizes and train/validation overlap statistics."""
+def compare_vocabularies(
+    train_counts: Counter,
+    val_counts: Counter,
+) -> dict:
+    """Compute vocabulary sizes and overlap between splits."""
     train_vocab = set(train_counts)
     val_vocab = set(val_counts)
 
@@ -100,25 +113,52 @@ def compare_vocabularies(train_counts, val_counts):
     }
 
 
-def vocabulary_types(train_stats, val_stats):
+def vocabulary_types(
+    train_stats: dict,
+    val_stats: dict,
+) -> dict:
     """Associate each label type with its train and validation counters."""
     return {
-        "object_classes": (train_stats["class_counts"], val_stats["class_counts"]),
-        "attributes": (train_stats["attribute_counts"], val_stats["attribute_counts"]),
-        "relations": (train_stats["relation_counts"], val_stats["relation_counts"]),
+        "object_classes": (
+            train_stats["class_counts"],
+            val_stats["class_counts"],
+        ),
+        "attributes": (
+            train_stats["attribute_counts"],
+            val_stats["attribute_counts"],
+        ),
+        "relations": (
+            train_stats["relation_counts"],
+            val_stats["relation_counts"],
+        ),
     }
 
 
-def save_dataset_summary(train_stats, val_stats, output_dir):
-    """Save split sizes, annotation totals and vocabulary sizes."""
+def save_dataset_summary(
+    train_stats: dict,
+    val_stats: dict,
+    output_dir: Path,
+) -> None:
+    """Save dataset sizes, annotation totals, and vocabulary sizes."""
     output_path = output_dir / "dataset_summary.csv"
+
     fieldnames = [
-        "split", "images", "objects", "unique_classes", "attribute_instances",
-        "unique_attributes", "relation_instances", "unique_relations",
+        "split",
+        "images",
+        "objects",
+        "unique_classes",
+        "attribute_instances",
+        "unique_attributes",
+        "relation_instances",
+        "unique_relations",
     ]
 
     rows = []
-    for split, stats in (("train", train_stats), ("validation", val_stats)):
+
+    for split, stats in (
+        ("train", train_stats),
+        ("validation", val_stats),
+    ):
         rows.append({
             "split": split,
             "images": stats["num_images"],
@@ -136,29 +176,48 @@ def save_dataset_summary(train_stats, val_stats, output_dir):
         writer.writerows(rows)
 
 
-def save_vocabulary_overlap(train_stats, val_stats, output_dir):
-    """Save the number of shared and split-exclusive labels per type."""
+def save_vocabulary_overlap(
+    train_stats: dict,
+    val_stats: dict,
+    output_dir: Path,
+) -> None:
+    """Save shared and split-exclusive vocabulary sizes."""
     output_path = output_dir / "vocabulary_overlap.csv"
+
     rows = []
 
     for label_type, (train_counts, val_counts) in vocabulary_types(
         train_stats, val_stats
     ).items():
         comparison = compare_vocabularies(train_counts, val_counts)
-        rows.append({"type": label_type, **comparison})
+        rows.append({
+            "type": label_type,
+            **comparison,
+        })
 
     fieldnames = [
-        "type", "train_unique", "val_unique", "common", "train_only", "val_only",
+        "type",
+        "train_unique",
+        "val_unique",
+        "common",
+        "train_only",
+        "val_only",
     ]
+
     with output_path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
 
-def save_vocabulary_differences(train_stats, val_stats, output_dir):
-    """Save labels found exclusively in train or validation, with frequencies."""
+def save_vocabulary_differences(
+    train_stats: dict,
+    val_stats: dict,
+    output_dir: Path,
+) -> None:
+    """Save labels exclusive to either split and their frequencies."""
     output_path = output_dir / "vocabulary_differences.csv"
+
     rows = []
 
     for label_type, (train_counts, val_counts) in vocabulary_types(
@@ -194,16 +253,33 @@ def save_vocabulary_differences(train_stats, val_stats, output_dir):
                 "val_count": val_counts[label],
             })
 
-    fieldnames = ["type", "label", "presence", "train_count", "val_count"]
+    fieldnames = [
+        "type",
+        "label",
+        "presence",
+        "train_count",
+        "val_count",
+    ]
+
     with output_path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
 
-def save_frequency_table(train_counts, val_counts, filename, output_dir):
-    """Save label frequencies, sorted by train count, val count and label."""
+def save_frequency_table(
+    train_counts: Counter,
+    val_counts: Counter,
+    filename: str,
+    output_dir: Path,
+) -> None:
+    """Save label frequencies in deterministic order.
+
+    Labels are sorted by descending training count, descending
+    validation count, and then alphabetically.
+    """
     output_path = output_dir / filename
+
     all_labels = sorted(
         set(train_counts) | set(val_counts),
         key=lambda label: (
@@ -216,6 +292,7 @@ def save_frequency_table(train_counts, val_counts, filename, output_dir):
     with output_path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
         writer.writerow(["label", "train_count", "val_count"])
+
         for label in all_labels:
             writer.writerow([
                 label,
@@ -224,13 +301,15 @@ def save_frequency_table(train_counts, val_counts, filename, output_dir):
             ])
 
 
-def main():
-    """Analyze both splits and write the six CSV tables for one dataset."""
+def main() -> None:
+    """Analyze train and validation splits and export six CSV tables."""
     args = parse_args()
+
     annotation_dir = DATASET_DIRS[args.dataset]
     output_dir = OUTPUT_ROOT / args.dataset / "tables"
 
     print(f"Loading GQA {args.dataset} scene graphs...")
+
     train_data = load_json(annotation_dir / "train_sceneGraphs.json")
     val_data = load_json(annotation_dir / "val_sceneGraphs.json")
 
@@ -241,21 +320,30 @@ def main():
     val_stats = analyze_split(val_data)
 
     output_dir.mkdir(parents=True, exist_ok=True)
+
     save_dataset_summary(train_stats, val_stats, output_dir)
     save_vocabulary_overlap(train_stats, val_stats, output_dir)
     save_vocabulary_differences(train_stats, val_stats, output_dir)
+
     save_frequency_table(
-        train_stats["class_counts"], val_stats["class_counts"],
-        "class_frequencies.csv", output_dir,
+        train_stats["class_counts"],
+        val_stats["class_counts"],
+        "class_frequencies.csv",
+        output_dir,
     )
     save_frequency_table(
-        train_stats["attribute_counts"], val_stats["attribute_counts"],
-        "attribute_frequencies.csv", output_dir,
+        train_stats["attribute_counts"],
+        val_stats["attribute_counts"],
+        "attribute_frequencies.csv",
+        output_dir,
     )
     save_frequency_table(
-        train_stats["relation_counts"], val_stats["relation_counts"],
-        "relation_frequencies.csv", output_dir,
+        train_stats["relation_counts"],
+        val_stats["relation_counts"],
+        "relation_frequencies.csv",
+        output_dir,
     )
+
     print(f"Saved analysis tables to: {output_dir}")
 
 
