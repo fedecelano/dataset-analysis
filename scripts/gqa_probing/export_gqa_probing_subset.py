@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
-"""Export the frozen GQA probing 5k subset for transfer to a compute cluster.
+"""Materialize the frozen GQA probing subset inside its selection directory.
 
-Reads existing train/val/test ID lists; NEVER resamples. Copies the original
-image bytes and writes split-specific filtered scene-graph JSON files. The new
-train and val use preprocessed GQA train annotations; test uses GQA val.
+This script NEVER samples or changes the selected image IDs. It reads
+train_ids.json, val_ids.json and test_ids.json from --subset-dir, exports
+split-specific prepared scene graphs, and copies the corresponding source
+images into images/{train,val,test}/.
 
-Does not modify original images, GQA annotations, subset IDs, or cleaning data.
+The new train and validation use prepared GQA train annotations; the new test
+uses prepared GQA validation annotations. The entire scene graph record is
+preserved, including original-label provenance fields when present.
+
+Existing export directories are never overwritten. The original images,
+prepared annotations, frozen selection IDs and sampling statistics remain
+untouched.
 """
 from __future__ import annotations
 
@@ -18,7 +25,9 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 SPLITS = ("train", "val", "test")
-SUFFIXES = (".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG")
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+EXPORT_DIRECTORIES = ("annotations", "images", "image_ids")
+REPORT_NAME = "export_report.json"
 
 
 def read_json(path: Path):
@@ -26,7 +35,7 @@ def read_json(path: Path):
         return json.load(stream)
 
 
-def write_json(path: Path, data):
+def write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as stream:
         json.dump(data, stream, ensure_ascii=False, separators=(",", ":"))
@@ -34,135 +43,242 @@ def write_json(path: Path, data):
 
 
 def safe_id(image_id: str) -> str:
-    """Avoid writing unexpected paths from external JSON."""
-    if not isinstance(image_id, str) or not image_id or image_id in (".", ".."):
-        raise ValueError(f"Invalid image ID: {image_id!r}")
-    if any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in image_id):
+    """Only allow image IDs suitable for a single filename stem."""
+    if (not isinstance(image_id, str) or not image_id
+            or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+                   for c in image_id)):
         raise ValueError(f"Unsafe image ID: {image_id!r}")
     return image_id
 
 
-def find_image(image_dir: Path, image_id: str) -> Path:
-    """Find one physical image; Windows extension casing is case-insensitive.
+def read_selection(subset_dir: Path) -> dict[str, list[str]]:
+    """Read frozen IDs and validate uniqueness and split disjointness."""
+    ids = {}
+    for split in SPLITS:
+        path = subset_dir / f"{split}_ids.json"
+        values = read_json(path)
+        if not isinstance(values, list):
+            raise ValueError(f"{path}: expected a JSON list")
+        values = [safe_id(v) for v in values]
+        if len(values) != len(set(values)):
+            raise ValueError(f"{path}: duplicate image IDs")
+        if not values:
+            raise ValueError(f"{path}: empty split")
+        ids[split] = values
 
-    On Windows, both ``123.jpg`` and ``123.JPG`` can point to the same file.
-    Only raise for genuinely distinct files with the same image ID.
-    """
-    candidates = [image_dir / (image_id + ext) for ext in SUFFIXES]
-    matches: list[Path] = []
-    for candidate in candidates:
-        if not candidate.is_file():
-            continue
-        if any(candidate.samefile(existing) for existing in matches):
-            continue
-        matches.append(candidate)
-    if not matches:
-        raise FileNotFoundError(
-            f"No image for ID {image_id} in {image_dir} (jpg/jpeg/png)"
-        )
-    if len(matches) > 1:
-        raise ValueError(
-            f"Multiple DISTINCT images for ID {image_id}: {matches}. "
-            "Resolve duplicates before exporting."
-        )
-    return matches[0]
+    for index, first in enumerate(SPLITS):
+        for second in SPLITS[index + 1:]:
+            overlap = set(ids[first]) & set(ids[second])
+            if overlap:
+                raise ValueError(
+                    f"Overlapping IDs between {first} and {second}: "
+                    f"{sorted(overlap)[:5]}"
+                )
+    return ids
 
 
-def export(subset_dir: Path, annotations_dir: Path, images_dir: Path, output_dir: Path):
-    if output_dir.exists():
-        raise FileExistsError(f"Output already exists: {output_dir}. Choose a new output path.")
+def index_images(images_dir: Path) -> dict[str, list[Path]]:
+    """Index image files by filename stem, ignoring unsupported extensions."""
     if not images_dir.is_dir():
-        raise FileNotFoundError(f"Original image directory missing: {images_dir}")
-    if not annotations_dir.is_dir():
-        raise FileNotFoundError(f"Preprocessed annotation directory missing: {annotations_dir}")
+        raise FileNotFoundError(f"Image directory not found: {images_dir}")
+    indexed: dict[str, list[Path]] = {}
+    for path in images_dir.iterdir():
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+            indexed.setdefault(path.stem, []).append(path)
+    return indexed
 
+
+def resolve_image(image_id: str, image_index: dict[str, list[Path]]) -> Path:
+    """Require one physical image per ID; ignore case aliases to the same file."""
+    candidates = image_index.get(image_id, [])
+    unique: list[Path] = []
+    for path in candidates:
+        if not any(path.samefile(other) for other in unique):
+            unique.append(path)
+    if not unique:
+        raise FileNotFoundError(f"No source image found for image ID {image_id}")
+    if len(unique) != 1:
+        raise ValueError(
+            f"Multiple distinct source images for ID {image_id}: "
+            f"{[str(p) for p in sorted(unique)]}"
+        )
+    return unique[0]
+
+
+def export(subset_dir: Path, annotations_dir: Path, images_dir: Path) -> None:
+    """Export the selected subset without modifying its frozen selection."""
+    if not subset_dir.is_dir():
+        raise FileNotFoundError(f"Subset directory not found: {subset_dir}")
+    if not annotations_dir.is_dir():
+        raise FileNotFoundError(f"Annotations directory not found: {annotations_dir}")
+    if not images_dir.is_dir():
+        raise FileNotFoundError(f"Images directory not found: {images_dir}")
+
+    # The source images must never overlap the export's destination tree.
+    destination_images = subset_dir / "images"
+    if (images_dir == destination_images or images_dir in destination_images.parents
+            or destination_images in images_dir.parents):
+        raise ValueError("Source images and export image directory must be disjoint")
+
+    published_paths = [subset_dir / name for name in EXPORT_DIRECTORIES]
+    published_paths.append(subset_dir / REPORT_NAME)
+    existing = [path for path in published_paths if path.exists()]
+    if existing:
+        raise FileExistsError(
+            "Export files already exist; selection files are preserved. "
+            f"Remove or archive only the prior export paths before rerunning: {existing}"
+        )
+
+    ids = read_selection(subset_dir)
     source_graphs = {
         "train": read_json(annotations_dir / "train_sceneGraphs.json"),
         "val": read_json(annotations_dir / "val_sceneGraphs.json"),
     }
-    ids = {}
+    if not all(isinstance(graphs, dict) for graphs in source_graphs.values()):
+        raise ValueError("Prepared scene-graph files must contain JSON objects")
+    if set(source_graphs["train"]) & set(source_graphs["val"]):
+        raise ValueError("Prepared source train and validation image IDs overlap")
+
+    image_index = index_images(images_dir)
     sources = {}
     for split in SPLITS:
-        values = read_json(subset_dir / f"{split}_ids.json")
-        if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
-            raise ValueError(f"{split}_ids.json must contain a JSON list of string IDs")
-        values = [safe_id(v) for v in values]
-        if len(values) != len(set(values)):
-            raise ValueError(f"Duplicate image IDs in {split}_ids.json")
-        ids[split] = values
-        sources[split] = "val" if split == "test" else "train"
-
-    for a in SPLITS:
-        for b in SPLITS:
-            if a < b and set(ids[a]) & set(ids[b]):
-                raise ValueError(f"Overlapping image IDs between {a} and {b}")
-    if set(source_graphs["train"]) & set(source_graphs["val"]):
-        raise ValueError("Overlap between source GQA train and val scene graph IDs")
-
-    # Preflight everything before copying to avoid incomplete exports.
-    images = {}
-    for split in SPLITS:
-        graphs = source_graphs[sources[split]]
+        source_name = "val" if split == "test" else "train"
+        graphs = source_graphs[source_name]
         missing = [image_id for image_id in ids[split] if image_id not in graphs]
         if missing:
-            raise ValueError(f"{split}: {len(missing)} IDs missing in GQA {sources[split]} annotations; examples: {missing[:5]}")
-        images[split] = {image_id: find_image(images_dir, image_id) for image_id in ids[split]}
+            raise ValueError(
+                f"{split}: {len(missing)} IDs absent from prepared {source_name} "
+                f"annotations (examples: {missing[:5]})"
+            )
+        sources[split] = {
+            image_id: resolve_image(image_id, image_index) for image_id in ids[split]
+        }
 
-    output_dir.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=output_dir.name + ".staging.", dir=output_dir.parent) as staging_str:
-        staging = Path(staging_str)
-        report = {"description": "Frozen 3k/1k/1k GQA probing export", "splits": {}}
+    # Construct the export in a temporary directory within the subset parent.
+    # Publish only after all copies and annotation files are complete.
+    with tempfile.TemporaryDirectory(
+        prefix=".probing_export_staging_", dir=subset_dir
+    ) as temporary:
+        staging = Path(temporary)
+        report = {
+            "description": "Frozen GQA probing subset (no resampling)",
+            "source_annotations_dir": str(annotations_dir),
+            "source_images_dir": str(images_dir),
+            "splits": {},
+        }
         for split in SPLITS:
-            graphs = source_graphs[sources[split]]
-            selected_graphs = {image_id: graphs[image_id] for image_id in ids[split]}
-            write_json(staging / "annotations" / f"{split}_sceneGraphs.json", selected_graphs)
-            write_json(staging / "image_ids" / f"{split}_ids.json", ids[split])
-            image_root = staging / "images" / split
-            image_root.mkdir(parents=True, exist_ok=True)
+            source_name = "val" if split == "test" else "train"
+            selected = {
+                image_id: source_graphs[source_name][image_id]
+                for image_id in ids[split]
+            }
+            for image_id, graph in selected.items():
+                if not isinstance(graph, dict) or not isinstance(graph.get("objects"), dict):
+                    raise ValueError(f"Invalid scene graph for {split}/{image_id}")
+
+            write_json(
+                staging / "annotations" / f"{split}_sceneGraphs.json", selected
+            )
+            id_path = staging / "image_ids" / f"{split}.txt"
+            id_path.parent.mkdir(parents=True, exist_ok=True)
+            id_path.write_text(
+                "".join(f"{image_id}\n" for image_id in ids[split]),
+                encoding="utf-8",
+            )
+
+            image_destination = staging / "images" / split
+            image_destination.mkdir(parents=True, exist_ok=True)
             extensions = Counter()
             for image_id in ids[split]:
-                source = images[split][image_id]
-                shutil.copy2(source, image_root / source.name)
-                extensions[source.suffix.lower()] += 1
+                source_image = sources[split][image_id]
+                shutil.copy2(source_image, image_destination / source_image.name)
+                extensions[source_image.suffix.lower()] += 1
+
             report["splits"][split] = {
                 "images": len(ids[split]),
-                "scene_graphs": len(selected_graphs),
-                "annotation_source": f"{sources[split]}_sceneGraphs.json",
-                "image_extensions": dict(extensions),
-                "objects": sum(len(scene["objects"]) for scene in selected_graphs.values()),
+                "scene_graphs": len(selected),
+                "objects": sum(len(graph["objects"]) for graph in selected.values()),
+                "annotation_source": f"{source_name}_sceneGraphs.json",
+                "image_extensions": dict(sorted(extensions.items())),
             }
-            print(f"{split}: {len(ids[split]):,} original images copied; {len(selected_graphs):,} scene graphs")
-        write_json(staging / "export_report.json", report)
-        # Publish only after all data have been written. Windows sometimes
-        # rejects directory rename (WinError 5) because a process temporarily
-        # holds a handle inside the staging directory. Fall back to copying.
+            print(f"{split}: exported {len(ids[split]):,} images and scene graphs")
+
+        write_json(staging / REPORT_NAME, report)
+
+        # Windows can refuse directory renames when an external process holds
+        # a handle to a recently written file (WinError 5). A copy-based
+        # fallback publishes the already verified staging data without
+        # changing the frozen selection. The report is published LAST.
+        published: list[Path] = []
+        active_target: Path | None = None
         try:
-            staging.rename(output_dir)
-        except PermissionError:
-            if output_dir.exists():
+            for name in EXPORT_DIRECTORIES:
+                active_target = subset_dir / name
+                if active_target.exists():
+                    raise FileExistsError(
+                        f"Destination appeared during export: {active_target}"
+                    )
+                staged_path = staging / name
+                try:
+                    staged_path.rename(active_target)
+                except PermissionError:
+                    if active_target.exists():
+                        raise FileExistsError(
+                            f"Destination appeared during export: {active_target}"
+                        )
+                    print(f"Windows blocked rename for {name}; copying instead.")
+                    shutil.copytree(staged_path, active_target)
+                published.append(active_target)
+                active_target = None
+
+            active_target = subset_dir / REPORT_NAME
+            if active_target.exists():
                 raise FileExistsError(
-                    f"Cannot publish export: destination already exists: {output_dir}"
+                    f"Destination appeared during export: {active_target}"
                 )
-            print("Directory rename blocked by Windows; publishing via copytree instead.")
-            try:
-                shutil.copytree(staging, output_dir)
-            except Exception:
-                # Do not leave a partial export looking like a completed one.
-                shutil.rmtree(output_dir, ignore_errors=True)
-                raise
-            # Keep the complete report inside the published directory; the
-            # TemporaryDirectory context will clean up staging automatically.
-    print(f"Exported to: {output_dir.resolve()}")
+            # Copying a small JSON report avoids a final Windows rename.
+            shutil.copy2(staging / REPORT_NAME, active_target)
+            published.append(active_target)
+            active_target = None
+        except Exception:
+            # Undo only output paths created by this invocation. Never touch
+            # frozen *_ids.json or sampling_stats.json.
+            if active_target is not None and active_target.exists():
+                if active_target.is_dir():
+                    shutil.rmtree(active_target)
+                else:
+                    active_target.unlink()
+            for path in reversed(published):
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+            raise
+
+    print(f"Export completed in: {subset_dir}")
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--subset-dir", type=Path, default=ROOT / "data/gqa_probing/subsets/probing_5k")
-    parser.add_argument("--annotations-dir", type=Path, default=ROOT / "data/gqa_probing/annotations")
-    parser.add_argument("--images-dir", type=Path, default=ROOT / "data/gqa/images")
-    parser.add_argument("--output-dir", type=Path, default=ROOT / "data/gqa_probing/exports/probing_5k")
+    parser.add_argument(
+        "--subset-dir", type=Path,
+        default=ROOT / "data" / "gqa_probing" / "subsets" / "probing_5k",
+        help="Directory with frozen *_ids.json; exported files are written here.",
+    )
+    parser.add_argument(
+        "--annotations-dir", type=Path,
+        default=ROOT / "data" / "gqa_probing" / "annotations",
+    )
+    parser.add_argument(
+        "--images-dir", type=Path,
+        default=ROOT / "data" / "gqa" / "images",
+    )
     args = parser.parse_args()
-    export(args.subset_dir.resolve(), args.annotations_dir.resolve(), args.images_dir.resolve(), args.output_dir.resolve())
+    export(
+        args.subset_dir.resolve(),
+        args.annotations_dir.resolve(),
+        args.images_dir.resolve(),
+    )
 
 
 if __name__ == "__main__":
