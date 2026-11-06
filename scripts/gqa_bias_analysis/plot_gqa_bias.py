@@ -42,7 +42,7 @@ ANALYSES = {
     "object_attribute": {
         "dir": "object_attribute", "files": ("object_attribute_associations.csv", "ranked_object_attribute_associations.csv"),
         "levels": {
-            "macro_object_macro_attribute": ("object_label", "attribute_label", "p_attribute_given_object_pct", "pair_object_instances", "P(attribute | object) [%]"),
+            "macro_object_macro_attribute": ("object_label", "attribute_label", "lift", "pair_object_instances", "Lift"),
             "macro_object_original_attribute": ("object_label", "attribute_label", "lift", "pair_object_instances", "Lift"),
             "original_object_original_attribute": ("object_label", "attribute_label", "lift", "pair_object_instances", "Lift"),
         },
